@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Force rebuild - updated 2025-12-03
+RUN echo "Build timestamp: 2025-12-03-23:25:00"
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     gdal-bin \
