@@ -8,6 +8,13 @@ print("Loading shapefiles...")
 PARCELS = gpd.read_file('data/Parcels_export.shp', engine='pyogrio')
 STREETS = gpd.read_file('data/Streets.shp', engine='pyogrio')
 print(f"Loaded {len(PARCELS)} parcels and {len(STREETS)} streets")
+print(f"Parcels CRS: {PARCELS.crs}")
+print(f"Streets CRS: {STREETS.crs}")
+
+# Ensure same CRS
+if PARCELS.crs != STREETS.crs:
+    print(f"Reprojecting streets to match parcels CRS")
+    STREETS = STREETS.to_crs(PARCELS.crs)
 
 def normalize_parcel_id(parcel_id):
     """Remove R prefix and leading zeros"""
@@ -21,38 +28,51 @@ def health():
     return jsonify({
         "status": "healthy",
         "parcels_loaded": len(PARCELS),
-        "streets_loaded": len(STREETS)
+        "streets_loaded": len(STREETS),
+        "parcels_crs": str(PARCELS.crs),
+        "streets_crs": str(STREETS.crs)
     })
 
-@app.route('/sample-parcels', methods=['GET'])
-def sample_parcels():
-    """Return sample parcel IDs with frontage for testing"""
-    samples = []
-    public_streets = STREETS[STREETS['CFCC'].isin(['A41', 'A51'])]
+@app.route('/debug-parcel', methods=['POST'])
+def debug_parcel():
+    """Debug endpoint to see parcel geometry and nearby streets"""
+    data = request.get_json()
+    parcel_id = data.get('parcel_id')
+    buffer_distance = data.get('buffer_distance', 100)  # feet
     
-    # Check first 100 parcels to find some with frontage
-    for idx, parcel in PARCELS.head(100).iterrows():
-        parcel_boundary = parcel.geometry.boundary
-        has_frontage = False
+    if not parcel_id:
+        return jsonify({"error": "parcel_id required"}), 400
+    
+    normalized_id = normalize_parcel_id(parcel_id)
+    parcel_match = PARCELS[PARCELS['PROP_ID'].astype(str) == normalized_id]
+    
+    if parcel_match.empty:
+        return jsonify({"error": "Parcel not found"}), 404
+    
+    parcel = parcel_match.iloc[0]
+    parcel_geom = parcel.geometry
+    
+    # Buffer the parcel to find nearby streets
+    buffered = parcel_geom.buffer(buffer_distance)
+    nearby_streets = STREETS[STREETS.intersects(buffered)]
+    
+    street_info = []
+    for idx, street in nearby_streets.iterrows():
+        street_name = f"{street.get('FEDIRP', '')} {street.get('FENAME', '')} {street.get('FETYPE', '')}".strip()
+        distance = parcel_geom.distance(street.geometry)
         
-        for _, street in public_streets.iterrows():
-            intersection = parcel_boundary.intersection(street.geometry)
-            if not intersection.is_empty and intersection.length > 0:
-                has_frontage = True
-                break
-        
-        if has_frontage:
-            samples.append({
-                "parcel_id": str(parcel['PROP_ID']),
-                "address": f"{parcel.get('situs_num', '')} {parcel.get('situs_stre', '')}, {parcel.get('situs_city', '')}".strip()
-            })
-            
-            if len(samples) >= 10:
-                break
+        street_info.append({
+            "street_name": street_name,
+            "cfcc": street.get('CFCC'),
+            "distance_ft": round(distance, 2)
+        })
     
     return jsonify({
-        "sample_count": len(samples),
-        "samples": samples
+        "parcel_id": normalized_id,
+        "parcel_bounds": list(parcel_geom.bounds),
+        "parcel_area_sqft": round(parcel_geom.area, 2),
+        "nearby_streets_count": len(street_info),
+        "nearby_streets": street_info[:10]  # First 10
     })
 
 @app.route('/calculate-frontage', methods=['POST'])
