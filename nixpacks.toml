@@ -1,2 +1,2 @@
 [phases.setup]
-nixPkgs = ["geos", "gdal"]
+nixPkgs = ["geos", "gdal", "expat"]
