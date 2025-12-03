@@ -29,6 +29,7 @@ def health():
 def calculate_frontage():
     data = request.get_json()
     parcel_id = data.get('parcel_id')
+    include_private = data.get('include_private', False)  # NEW: optional flag
     
     if not parcel_id:
         return jsonify({"error": "parcel_id required"}), 400
@@ -52,25 +53,40 @@ def calculate_frontage():
     # Get parcel boundary
     parcel_boundary = parcel_geom.boundary
     
-    # Find intersecting streets (only public roads: A41, A51)
-    public_streets = STREETS[STREETS['CFCC'].isin(['A41', 'A51'])]
+    # Filter streets based on include_private flag
+    if include_private:
+        filtered_streets = STREETS
+    else:
+        # Only public roads: A41, A51
+        filtered_streets = STREETS[STREETS['CFCC'].isin(['A41', 'A51'])]
     
     # Calculate frontage for each street
     frontages = []
     total_frontage = 0
     
-    for idx, street in public_streets.iterrows():
+    for idx, street in filtered_streets.iterrows():
         intersection = parcel_boundary.intersection(street.geometry)
         if not intersection.is_empty:
             frontage_ft = intersection.length
             if frontage_ft > 0:
                 street_name = f"{street.get('FEDIRP', '')} {street.get('FENAME', '')} {street.get('FETYPE', '')} {street.get('FEDIRS', '')}".strip()
-                road_type = 'Secondary Highway' if street['CFCC'] == 'A41' else 'Local Road'
+                
+                # Decode road type
+                cfcc = street.get('CFCC', '')
+                if cfcc == 'A41':
+                    road_type = 'Secondary Highway'
+                elif cfcc == 'A51':
+                    road_type = 'Local Road'
+                elif cfcc == 'PR':
+                    road_type = 'Private Road'
+                else:
+                    road_type = f'Other ({cfcc})'
                 
                 frontages.append({
                     "street_name": street_name,
                     "frontage_ft": round(frontage_ft, 2),
-                    "road_type": road_type
+                    "road_type": road_type,
+                    "cfcc": cfcc
                 })
                 total_frontage += frontage_ft
     
@@ -86,7 +102,8 @@ def calculate_frontage():
         "address": address,
         "total_frontage_ft": round(total_frontage, 2),
         "road_count": len(frontages),
-        "roads": frontages
+        "roads": frontages,
+        "include_private": include_private
     })
 
 if __name__ == '__main__':
