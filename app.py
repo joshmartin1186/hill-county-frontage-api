@@ -5,7 +5,6 @@ import os
 app = Flask(__name__)
 
 print("Loading shapefiles...")
-# Explicitly use pyogrio engine
 PARCELS = gpd.read_file('data/Parcels_export.shp', engine='pyogrio')
 STREETS = gpd.read_file('data/Streets.shp', engine='pyogrio')
 print(f"Loaded {len(PARCELS)} parcels and {len(STREETS)} streets")
@@ -25,19 +24,47 @@ def health():
         "streets_loaded": len(STREETS)
     })
 
+@app.route('/sample-parcels', methods=['GET'])
+def sample_parcels():
+    """Return sample parcel IDs with frontage for testing"""
+    samples = []
+    public_streets = STREETS[STREETS['CFCC'].isin(['A41', 'A51'])]
+    
+    # Check first 100 parcels to find some with frontage
+    for idx, parcel in PARCELS.head(100).iterrows():
+        parcel_boundary = parcel.geometry.boundary
+        has_frontage = False
+        
+        for _, street in public_streets.iterrows():
+            intersection = parcel_boundary.intersection(street.geometry)
+            if not intersection.is_empty and intersection.length > 0:
+                has_frontage = True
+                break
+        
+        if has_frontage:
+            samples.append({
+                "parcel_id": str(parcel['PROP_ID']),
+                "address": f"{parcel.get('situs_num', '')} {parcel.get('situs_stre', '')}, {parcel.get('situs_city', '')}".strip()
+            })
+            
+            if len(samples) >= 10:
+                break
+    
+    return jsonify({
+        "sample_count": len(samples),
+        "samples": samples
+    })
+
 @app.route('/calculate-frontage', methods=['POST'])
 def calculate_frontage():
     data = request.get_json()
     parcel_id = data.get('parcel_id')
-    include_private = data.get('include_private', False)  # NEW: optional flag
+    include_private = data.get('include_private', False)
     
     if not parcel_id:
         return jsonify({"error": "parcel_id required"}), 400
     
-    # Normalize the parcel ID
     normalized_id = normalize_parcel_id(parcel_id)
-    
-    # Find the parcel
     parcel_match = PARCELS[PARCELS['PROP_ID'].astype(str) == normalized_id]
     
     if parcel_match.empty:
@@ -49,18 +76,13 @@ def calculate_frontage():
     
     parcel = parcel_match.iloc[0]
     parcel_geom = parcel.geometry
-    
-    # Get parcel boundary
     parcel_boundary = parcel_geom.boundary
     
-    # Filter streets based on include_private flag
     if include_private:
         filtered_streets = STREETS
     else:
-        # Only public roads: A41, A51
         filtered_streets = STREETS[STREETS['CFCC'].isin(['A41', 'A51'])]
     
-    # Calculate frontage for each street
     frontages = []
     total_frontage = 0
     
@@ -71,7 +93,6 @@ def calculate_frontage():
             if frontage_ft > 0:
                 street_name = f"{street.get('FEDIRP', '')} {street.get('FENAME', '')} {street.get('FETYPE', '')} {street.get('FEDIRS', '')}".strip()
                 
-                # Decode road type
                 cfcc = street.get('CFCC', '')
                 if cfcc == 'A41':
                     road_type = 'Secondary Highway'
@@ -90,10 +111,7 @@ def calculate_frontage():
                 })
                 total_frontage += frontage_ft
     
-    # Sort by frontage descending
     frontages.sort(key=lambda x: x['frontage_ft'], reverse=True)
-    
-    # Build address
     address = f"{parcel.get('situs_num', '')} {parcel.get('situs_stre', '')}, {parcel.get('situs_city', '')} {parcel.get('situs_zip', '')}".strip()
     
     return jsonify({
