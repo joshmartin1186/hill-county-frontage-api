@@ -22,6 +22,78 @@ def normalize_parcel_id(parcel_id):
         parcel_id = parcel_id[1:]
     return str(int(parcel_id))
 
+def calculate_parcel_frontage(parcel_id, tolerance=30, include_private=False):
+    """Helper function to calculate frontage for a single parcel"""
+    try:
+        normalized_id = normalize_parcel_id(parcel_id)
+        parcel_match = PARCELS[PARCELS['PROP_ID'].astype(str) == normalized_id]
+        
+        if parcel_match.empty:
+            return {
+                "parcel_id": parcel_id,
+                "normalized_id": normalized_id,
+                "error": "Parcel not found"
+            }
+        
+        parcel = parcel_match.iloc[0]
+        parcel_geom = parcel.geometry
+        parcel_boundary = parcel_geom.boundary.buffer(tolerance)
+        
+        if include_private:
+            filtered_streets = STREETS
+        else:
+            filtered_streets = STREETS[
+                STREETS['CFCC'].notna() & 
+                STREETS['CFCC'].isin(['A41', 'A51'])
+            ]
+        
+        frontages = []
+        total_frontage = 0
+        
+        for idx, street in filtered_streets.iterrows():
+            intersection = parcel_boundary.intersection(street.geometry)
+            if not intersection.is_empty:
+                frontage_ft = intersection.length
+                if frontage_ft > 0:
+                    street_name = f"{street.get('FEDIRP', '')} {street.get('FENAME', '')} {street.get('FETYPE', '')} {street.get('FEDIRS', '')}".strip()
+                    
+                    cfcc = street.get('CFCC', 'Unknown')
+                    if cfcc == 'A41':
+                        road_type = 'Secondary Highway'
+                    elif cfcc == 'A51':
+                        road_type = 'Local Road'
+                    elif cfcc == 'PR' or 'PR' in str(street.get('FENAME', '')):
+                        road_type = 'Private Road'
+                    else:
+                        road_type = f'Other ({cfcc})'
+                    
+                    frontages.append({
+                        "street_name": street_name,
+                        "frontage_ft": round(frontage_ft, 2),
+                        "road_type": road_type,
+                        "cfcc": str(cfcc) if cfcc else "None"
+                    })
+                    total_frontage += frontage_ft
+        
+        frontages.sort(key=lambda x: x['frontage_ft'], reverse=True)
+        address = f"{parcel.get('situs_num', '')} {parcel.get('situs_stre', '')}, {parcel.get('situs_city', '')} {parcel.get('situs_zip', '')}".strip()
+        
+        return {
+            "parcel_id": parcel_id,
+            "normalized_id": normalized_id,
+            "address": address,
+            "total_frontage_ft": round(total_frontage, 2),
+            "road_count": len(frontages),
+            "roads": frontages,
+            "include_private": include_private,
+            "tolerance_ft": tolerance
+        }
+    except Exception as e:
+        return {
+            "parcel_id": parcel_id,
+            "error": str(e)
+        }
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
@@ -30,6 +102,35 @@ def health():
         "streets_loaded": len(STREETS),
         "parcels_crs": str(PARCELS.crs),
         "streets_crs": str(STREETS.crs)
+    })
+
+@app.route('/batch-calculate', methods=['POST'])
+def batch_calculate():
+    """Calculate frontage for multiple parcels at once"""
+    data = request.get_json()
+    parcel_ids = data.get('parcel_ids', [])
+    tolerance = data.get('tolerance', 30)
+    include_private = data.get('include_private', False)
+    
+    if not parcel_ids:
+        return jsonify({"error": "parcel_ids array required"}), 400
+    
+    results = []
+    for parcel_id in parcel_ids:
+        result = calculate_parcel_frontage(parcel_id, tolerance, include_private)
+        results.append(result)
+    
+    # Summary stats
+    found_count = sum(1 for r in results if 'error' not in r)
+    with_frontage = sum(1 for r in results if 'error' not in r and r['total_frontage_ft'] > 0)
+    
+    return jsonify({
+        "total_requested": len(parcel_ids),
+        "found": found_count,
+        "not_found": len(parcel_ids) - found_count,
+        "with_frontage": with_frontage,
+        "no_frontage": found_count - with_frontage,
+        "results": results
     })
 
 @app.route('/debug-parcel', methods=['POST'])
@@ -51,7 +152,6 @@ def debug_parcel():
     parcel = parcel_match.iloc[0]
     parcel_geom = parcel.geometry
     
-    # Buffer the parcel to find nearby streets
     buffered = parcel_geom.buffer(buffer_distance)
     nearby_streets = STREETS[STREETS.intersects(buffered)]
     
@@ -79,75 +179,18 @@ def debug_parcel():
 def calculate_frontage():
     data = request.get_json()
     parcel_id = data.get('parcel_id')
+    tolerance = data.get('tolerance', 30)
     include_private = data.get('include_private', False)
-    tolerance = data.get('tolerance', 1.0)
     
     if not parcel_id:
         return jsonify({"error": "parcel_id required"}), 400
     
-    normalized_id = normalize_parcel_id(parcel_id)
-    parcel_match = PARCELS[PARCELS['PROP_ID'].astype(str) == normalized_id]
+    result = calculate_parcel_frontage(parcel_id, tolerance, include_private)
     
-    if parcel_match.empty:
-        return jsonify({
-            "error": "Parcel not found",
-            "parcel_id": parcel_id,
-            "normalized_id": normalized_id
-        }), 404
+    if 'error' in result:
+        return jsonify(result), 404
     
-    parcel = parcel_match.iloc[0]
-    parcel_geom = parcel.geometry
-    parcel_boundary = parcel_geom.boundary.buffer(tolerance)
-    
-    if include_private:
-        filtered_streets = STREETS
-    else:
-        filtered_streets = STREETS[
-            STREETS['CFCC'].notna() & 
-            STREETS['CFCC'].isin(['A41', 'A51'])
-        ]
-    
-    frontages = []
-    total_frontage = 0
-    
-    for idx, street in filtered_streets.iterrows():
-        intersection = parcel_boundary.intersection(street.geometry)
-        if not intersection.is_empty:
-            frontage_ft = intersection.length
-            if frontage_ft > 0:
-                street_name = f"{street.get('FEDIRP', '')} {street.get('FENAME', '')} {street.get('FETYPE', '')} {street.get('FEDIRS', '')}".strip()
-                
-                cfcc = street.get('CFCC', 'Unknown')
-                if cfcc == 'A41':
-                    road_type = 'Secondary Highway'
-                elif cfcc == 'A51':
-                    road_type = 'Local Road'
-                elif cfcc == 'PR' or 'PR' in str(street.get('FENAME', '')):
-                    road_type = 'Private Road'
-                else:
-                    road_type = f'Other ({cfcc})'
-                
-                frontages.append({
-                    "street_name": street_name,
-                    "frontage_ft": round(frontage_ft, 2),
-                    "road_type": road_type,
-                    "cfcc": str(cfcc) if cfcc else "None"
-                })
-                total_frontage += frontage_ft
-    
-    frontages.sort(key=lambda x: x['frontage_ft'], reverse=True)
-    address = f"{parcel.get('situs_num', '')} {parcel.get('situs_stre', '')}, {parcel.get('situs_city', '')} {parcel.get('situs_zip', '')}".strip()
-    
-    return jsonify({
-        "parcel_id": parcel_id,
-        "normalized_id": normalized_id,
-        "address": address,
-        "total_frontage_ft": round(total_frontage, 2),
-        "road_count": len(frontages),
-        "roads": frontages,
-        "include_private": include_private,
-        "tolerance_ft": tolerance
-    })
+    return jsonify(result)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
