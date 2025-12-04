@@ -32,12 +32,55 @@ def health():
         "streets_crs": str(STREETS.crs)
     })
 
+@app.route('/debug-parcel', methods=['POST'])
+def debug_parcel():
+    """Debug endpoint to see parcel geometry and nearby streets"""
+    data = request.get_json()
+    parcel_id = data.get('parcel_id')
+    buffer_distance = data.get('buffer_distance', 100)
+    
+    if not parcel_id:
+        return jsonify({"error": "parcel_id required"}), 400
+    
+    normalized_id = normalize_parcel_id(parcel_id)
+    parcel_match = PARCELS[PARCELS['PROP_ID'].astype(str) == normalized_id]
+    
+    if parcel_match.empty:
+        return jsonify({"error": "Parcel not found"}), 404
+    
+    parcel = parcel_match.iloc[0]
+    parcel_geom = parcel.geometry
+    
+    # Buffer the parcel to find nearby streets
+    buffered = parcel_geom.buffer(buffer_distance)
+    nearby_streets = STREETS[STREETS.intersects(buffered)]
+    
+    street_info = []
+    for idx, street in nearby_streets.iterrows():
+        street_name = f"{street.get('FEDIRP', '')} {street.get('FENAME', '')} {street.get('FETYPE', '')}".strip()
+        distance = parcel_geom.distance(street.geometry)
+        cfcc = street.get('CFCC')
+        
+        street_info.append({
+            "street_name": street_name,
+            "cfcc": str(cfcc) if cfcc is not None else "NULL",
+            "distance_ft": round(distance, 2)
+        })
+    
+    return jsonify({
+        "parcel_id": normalized_id,
+        "parcel_bounds": list(parcel_geom.bounds),
+        "parcel_area_sqft": round(parcel_geom.area, 2),
+        "nearby_streets_count": len(street_info),
+        "nearby_streets": street_info[:10]
+    })
+
 @app.route('/calculate-frontage', methods=['POST'])
 def calculate_frontage():
     data = request.get_json()
     parcel_id = data.get('parcel_id')
     include_private = data.get('include_private', False)
-    tolerance = data.get('tolerance', 1.0)  # Small buffer in feet for snap tolerance
+    tolerance = data.get('tolerance', 1.0)
     
     if not parcel_id:
         return jsonify({"error": "parcel_id required"}), 400
@@ -54,15 +97,11 @@ def calculate_frontage():
     
     parcel = parcel_match.iloc[0]
     parcel_geom = parcel.geometry
-    
-    # Use small buffer for snap tolerance
     parcel_boundary = parcel_geom.boundary.buffer(tolerance)
     
     if include_private:
-        # Include all streets
         filtered_streets = STREETS
     else:
-        # Only public roads - handle NULL CFCC as non-public
         filtered_streets = STREETS[
             STREETS['CFCC'].notna() & 
             STREETS['CFCC'].isin(['A41', 'A51'])
@@ -72,7 +111,6 @@ def calculate_frontage():
     total_frontage = 0
     
     for idx, street in filtered_streets.iterrows():
-        # Intersect buffered boundary with street
         intersection = parcel_boundary.intersection(street.geometry)
         if not intersection.is_empty:
             frontage_ft = intersection.length
